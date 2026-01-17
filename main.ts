@@ -1,5 +1,5 @@
 /**
- * Movement Labs to OpenAI Proxy (Stealth Mode)
+ * Movement Labs to OpenAI Proxy (Stealth + Tool Calling Support)
  * Deployed on Deno Deploy
  */
 
@@ -7,7 +7,7 @@ import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 
 const TARGET_URL = "https://movementlabs.ai/api/chat";
 
-// 伪装配置：完全模拟 Chrome 140 Linux 版本
+// === 1. 伪装配置 ===
 const FAKE_HEADERS_BASE = {
   "accept": "*/*",
   "accept-language": "zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
@@ -21,22 +21,49 @@ const FAKE_HEADERS_BASE = {
   "sec-fetch-dest": "empty",
   "sec-fetch-mode": "cors",
   "sec-fetch-site": "same-origin",
-  // 关键：User-Agent 必须与 Cookie 生成时的环境一致
   "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
 };
 
-// 随机 IP 生成器 (用于伪造 X-Forwarded-For)
+// 默认 Cookie (请务必在 Deno Deploy 环境变量 MOVEMENT_COOKIE 中配置)
+const DEFAULT_COOKIE = `请替换为你的真实Cookie`;
+
 function getRandomIp() {
   return Array(4).fill(0).map(() => Math.floor(Math.random() * 255)).join('.');
 }
 
-// 默认 Cookie (建议通过环境变量覆盖)
-const DEFAULT_COOKIE = `__client_uat=1768305449; __refresh_8YHPIyOx=s40qrTVvuyUfHobm6uhc; __client_uat_8YHPIyOx=1768305449; cf_clearance=o38m1S77g9O8JGQTxiRevC2Tbhtcs5JKYayAbTKqnyA-1768536929-1.2.1.1-OYB136VjKrCkdfTRynI8SBUnbSigPj_dkMUsJFBn0dykx_3pG.8v6EOsG_kHjgOYGUPwTPm6jga4YDZifpSGDcEc_GLK77kNnxnzGTACJHKucADGPvr541eR1D_VefSDd2.E2r_xebEvOvqBHXfTFhufy1XtpzaE0wik0wEyw0SeBfPZ70eFjb24tVaOnNFLhz5jv9ySDJyIhRneFQ0ocYOGPZdp.7iyhXHiKsKrXJo; cfz_zaraz-analytics=%7B%22_cfa_clientId%22%3A%7B%22v%22%3A%2267845109272994210%22%2C%22e%22%3A1798692079830%7D%2C%22_cfa_sId%22%3A%7B%22v%22%3A%2269955183204181710%22%2C%22e%22%3A1768663840178%7D%7D; cfzs_google-analytics_v4=%7B%22Vhiq_pageviewCounter%22%3A%7B%22v%22%3A%222%22%7D%7D; clerk_active_context=sess_38CZKUBoHnuu2A335FdHjqZM4xE:; __session=eyJhbGciOiJSUzI1NiIsImNhdCI6ImNsX0I3ZDRQRDExMUFBQSIsImtpZCI6Imluc18zNHZvbjFZYmR4cWpYU1BJeUROU0RUTTFZVkQiLCJ0eXAiOiJKV1QifQ.eyJhenAiOiJodHRwczovL21vdmVtZW50bGFicy5haSIsImV4cCI6MTc2ODY2MjEwMCwiZmVhIjoidToxMF9tZXNzYWdlc19wZXJfZGF5LHU6NV9oYXdrX3Byb21wdHNfcGVyX2RheSx1OmVtYWlsX3N1cHBvcnQiLCJmdmEiOls1OTQzLC0xXSwiaWF0IjoxNzY4NjYyMDQwLCJpc3MiOiJodHRwczovL2NsZXJrLm1vdmVtZW50bGFicy5haSIsIm5iZiI6MTc2ODY2MjAzMCwicGxhIjoidTpmcmVlX3VzZXIiLCJzaWQiOiJzZXNzXzM4Q1pLVUJvSG51dTJBMzM1RmRIanFaTTR4RSIsInN0cyI6ImFjdGl2ZSIsInN1YiI6InVzZXJfMzUwN2FUUHh2Q3RabXAxZDNTcVRydkVjWFBPIiwidiI6Mn0.ESwBP_ZZJT1vhCv5mWssazcEWuG0F-lDycIXm8_e6AC1nwoUIkzS4_PbteaCh-ZY1_oPWYdISnIxbh098mGe-zAt9AWeALqtLJf8sqaVTNWvAtToCW9kDHfazybHEviFcVnkNlO3hjmx37e6UiCQXPh-oTas-exIXTpjmSy4TRRzfF_HIQB1k2smqZNorQMIKq4ofeHJFJ3MPnRIqP6IkpWbwyzbq0Mybrm2TiXBf2zyMxNwv54AyIMRpPVkfjSjtTdnIwMG6wPYnBpPYSf0C8y6jfP3qH8ffEQqHEW0NEOf3VEECMCl4z8qdzRczLgzT5fLBXWhvbPdIELaSIUkIg; __session_8YHPIyOx=eyJhbGciOiJSUzI1NiIsImNhdCI6ImNsX0I3ZDRQRDExMUFBQSIsImtpZCI6Imluc18zNHZvbjFZYmR4cWpYU1BJeUROU0RUTTFZVkQiLCJ0eXAiOiJKV1QifQ.eyJhenAiOiJodHRwczovL21vdmVtZW50bGFicy5haSIsImV4cCI6MTc2ODY2MjEwMCwiZmVhIjoidToxMF9tZXNzYWdlc19wZXJfZGF5LHU6NV9oYXdrX3Byb21wdHNfcGVyX2RheSx1OmVtYWlsX3N1cHBvcnQiLCJmdmEiOls1OTQzLC0xXSwiaWF0IjoxNzY4NjYyMDQwLCJpc3MiOiJodHRwczovL2NsZXJrLm1vdmVtZW50bGFicy5haSIsIm5iZiI6MTc2ODY2MjAzMCwicGxhIjoidTpmcmVlX3VzZXIiLCJzaWQiOiJzZXNzXzM4Q1pLVUJvSG51dTJBMzM1RmRIanFaTTR4RSIsInN0cyI6ImFjdGl2ZSIsInN1YiI6InVzZXJfMzUwN2FUUHh2Q3RabXAxZDNTcVRydkVjWFBPIiwidiI6Mn0.ESwBP_ZZJT1vhCv5mWssazcEWuG0F-lDycIXm8_e6AC1nwoUIkzS4_PbteaCh-ZY1_oPWYdISnIxbh098mGe-zAt9AWeALqtLJf8sqaVTNWvAtToCW9kDHfazybHEviFcVnkNlO3hjmx37e6UiCQXPh-oTas-exIXTpjmSy4TRRzfF_HIQB1k2smqZNorQMIKq4ofeHJFJ3MPnRIqP6IkpWbwyzbq0Mybrm2TiXBf2zyMxNwv54AyIMRpPVkfjSjtTdnIwMG6wPYnBpPYSf0C8y6jfP3qH8ffEQqHEW0NEOf3VEECMCl4z8qdzRczLgzT5fLBXWhvbPdIELaSIUkIg`;
+// === 2. 工具处理逻辑 (Tool Calling) ===
+
+/**
+ * 将 OpenAI 的 tools 定义转换为模型能理解的 System Prompt
+ */
+function generateSystemPromptForTools(tools: any[]) {
+  const toolDescriptions = tools.map((t) => {
+    const fn = t.function;
+    return `
+Tool Name: ${fn.name}
+Description: ${fn.description || "No description"}
+Parameters: ${JSON.stringify(fn.parameters)}
+`;
+  }).join("\n---\n");
+
+  return `
+## Tool Usage Instructions
+You have access to the following tools. You are capable of using them to answer the user's request.
+
+${toolDescriptions}
+
+IMPORTANT:
+- If you need to use a tool, DO NOT output conversational text.
+- ONLY output a JSON block strictly matching the tool's signature.
+- Format: {"tool": "tool_name", "arguments": { ... }}
+- If no tool is needed, respond normally.
+`;
+}
 
 serve(async (req) => {
   const url = new URL(req.url);
 
-  // CORS 设置，允许跨域调用
+  // CORS
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -47,7 +74,7 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 1. 获取模型列表
+  // 1. GET /v1/models
   if (url.pathname === "/v1/models") {
     const models = [
       { id: "hawk-ultra", object: "model" },
@@ -60,28 +87,39 @@ serve(async (req) => {
     });
   }
 
-  // 2. 聊天接口
+  // 2. POST /v1/chat/completions
   if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
     try {
       const body = await req.json();
-      const model = body.model || "tensor-max";
+      let { model, messages, tools, tool_choice, stream } = body;
       
-      // 构造随机 IP
-      const fakeIp = getRandomIp();
-      
+      model = model || "tensor-max";
+
+      // === Tool Calling 注入逻辑 ===
+      if (tools && tools.length > 0) {
+        console.log("Tools detected, injecting system prompt...");
+        const toolPrompt = generateSystemPromptForTools(tools);
+        
+        // 检查是否已有 System Role，有则追加，无则新建
+        const systemMessageIndex = messages.findIndex((m: any) => m.role === "system");
+        if (systemMessageIndex > -1) {
+          messages[systemMessageIndex].content += `\n\n${toolPrompt}`;
+        } else {
+          messages.unshift({ role: "system", content: toolPrompt });
+        }
+      }
+
       // 构造请求头
+      const fakeIp = getRandomIp();
       const headers = new Headers(FAKE_HEADERS_BASE);
       headers.set("cookie", Deno.env.get("MOVEMENT_COOKIE") || DEFAULT_COOKIE);
-      // IP 伪装：尝试绕过简单的 IP 频率限制
       headers.set("X-Forwarded-For", fakeIp);
       headers.set("X-Real-IP", fakeIp);
 
       const payload = {
-        messages: body.messages.map((m: any) => ({ role: m.role, content: m.content })),
+        messages: messages.map((m: any) => ({ role: m.role, content: m.content })),
         model: model
       };
-
-      console.log(`Proxying to Movement Labs... Model: ${model}, Pseudo-IP: ${fakeIp}`);
 
       const response = await fetch(TARGET_URL, {
         method: "POST",
@@ -89,32 +127,23 @@ serve(async (req) => {
         body: JSON.stringify(payload)
       });
 
-      // 处理 Cloudflare 拦截 (常见状态码 403 或 503)
-      if (response.status === 403 || response.status === 503) {
-        const text = await response.text();
-        console.error("Cloudflare Blocked:", text.slice(0, 200));
-        return new Response(JSON.stringify({ 
-          error: {
-            message: "Upstream WAF Blocked. Cookie may be invalid or IP mismatched. Refresh cookie.",
-            type: "upstream_error",
-            code: response.status
-          }
-        }), { status: response.status, headers: { ...corsHeaders, "Content-Type": "application/json" }});
-      }
-
       if (!response.ok) {
-        return new Response(JSON.stringify({ error: await response.text() }), { status: response.status, headers: corsHeaders });
+        // 处理 Cloudflare 或 API 错误
+        const errorText = await response.text();
+        console.error("Upstream Error:", response.status, errorText);
+        return new Response(JSON.stringify({ 
+           error: { message: `Upstream error: ${response.status}`, details: errorText } 
+        }), { status: response.status, headers: corsHeaders });
       }
 
-      // 流式转换器
-      const stream = new ReadableStream({
+      // === 流式响应处理 ===
+      // 我们这里不做复杂的 JSON 抓取转换（不稳定），而是让模型直接输出 Text 格式的 JSON
+      // 客户端（如 LangChain）通常能处理 Text 中的 JSON Block
+      
+      const streamParser = new ReadableStream({
         async start(controller) {
           const reader = response.body?.getReader();
-          if (!reader) {
-            controller.close();
-            return;
-          }
-
+          if (!reader) { controller.close(); return; }
           const decoder = new TextDecoder();
           let buffer = "";
 
@@ -125,17 +154,17 @@ serve(async (req) => {
 
               buffer += decoder.decode(value, { stream: true });
               const lines = buffer.split("\n");
-              buffer = lines.pop() || ""; // 保留未完成的行
+              buffer = lines.pop() || "";
 
               for (const line of lines) {
                 if (!line.trim()) continue;
 
                 let content = null;
-                // 解析 Movement Labs 格式: 0:"text"
+                // 解析 Movement Labs 格式 0:"content"
                 if (line.startsWith('0:')) {
                   try {
                     content = JSON.parse(line.substring(2));
-                  } catch (e) { /* ignore parse error */ }
+                  } catch (e) { /* ignore */ }
                 }
 
                 if (content) {
@@ -144,12 +173,16 @@ serve(async (req) => {
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
                     model: model,
-                    choices: [{ index: 0, delta: { content }, finish_reason: null }]
+                    choices: [{ 
+                        index: 0, 
+                        delta: { content }, // 将内容（可能是 JSON 字符串）作为 content 返回
+                        finish_reason: null 
+                    }]
                   };
                   controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 }
 
-                // 结束信号
+                // 结束信号 d:{}
                 if (line.startsWith('d:') && line.includes('{}')) {
                     const endChunk = {
                         id: `chatcmpl-${Date.now()}`,
@@ -164,7 +197,7 @@ serve(async (req) => {
               }
             }
           } catch (e) {
-            console.error("Stream Error", e);
+            console.error("Stream parsing error:", e);
             controller.error(e);
           } finally {
             controller.close();
@@ -172,7 +205,7 @@ serve(async (req) => {
         }
       });
 
-      return new Response(stream, {
+      return new Response(streamParser, {
         headers: {
           ...corsHeaders,
           "Content-Type": "text/event-stream",
