@@ -1,13 +1,13 @@
 /**
- * Movement Labs to OpenAI Proxy (Stealth + Tool Calling)
- * Target: Deno Deploy
+ * Movement Labs to OpenAI Proxy (Stealth + Tool Calling + Reasoning)
+ * Deployed on Deno Deploy
  */
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 
 const TARGET_URL = "https://movementlabs.ai/api/chat";
 
-// Stealth Configuration: Mimicking Chrome 140 on Linux
+// 伪装配置
 const FAKE_HEADERS_BASE = {
   "accept": "*/*",
   "accept-language": "zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
@@ -24,54 +24,46 @@ const FAKE_HEADERS_BASE = {
   "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
 };
 
-// Random IP Generator for X-Forwarded-For to bypass simple rate limits
 function getRandomIp() {
   return Array(4).fill(0).map(() => Math.floor(Math.random() * 255)).join('.');
 }
 
-// Fallback Cookie (Always set MOVEMENT_COOKIE in Deno Environment Variables for stability)
-const DEFAULT_COOKIE = `__client_uat=1768305449; __refresh_8YHPIyOx=s40qrTVvuyUfHobm6uhc; __client_uat_8YHPIyOx=1768305449; cf_clearance=o38m1S77g9O8JGQTxiRevC2Tbhtcs5JKYayAbTKqnyA-1768536929-1.2.1.1-OYB136VjKrCkdfTRynI8SBUnbSigPj_dkMUsJFBn0dykx_3pG.8v6EOsG_kHjgOYGUPwTPm6jga4YDZifpSGDcEc_GLK77kNnxnzGTACJHKucADGPvr541eR1D_VefSDd2.E2r_xebEvOvqBHXfTFhufy1XtpzaE0wik0wEyw0SeBfPZ70eFjb24tVaOnNFLhz5jv9ySDJyIhRneFQ0ocYOGPZdp.7iyhXHiKsKrXJo; clerk_active_context=sess_38CZKUBoHnuu2A335FdHjqZM4xE:; __session=...;`;
+const DEFAULT_COOKIE = `__client_uat=1768305449; __refresh_8YHPIyOx=s40qrTVvuyUfHobm6uhc; __client_uat_8YHPIyOx=1768305449; cf_clearance=...;`;
 
 serve(async (req) => {
   const url = new URL(req.url);
 
-  // --- CORS Handling ---
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
     "Access-Control-Allow-Headers": "*",
   };
 
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
-  }
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-  // --- 1. Model List Endpoint ---
+  // 1. 模型列表
   if (url.pathname === "/v1/models") {
     const models = [
+      { id: "momentum-max", object: "model" },
       { id: "tensor-max", object: "model" },
-      { id: "hawk-ultra", object: "model" },
-      { id: "hawk-max", object: "model" },
-      { id: "momentum-max", object: "model" }
+      { id: "hawk-ultra", object: "model" }
     ];
     return new Response(JSON.stringify({ object: "list", data: models }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
   }
 
-  // --- 2. Chat Completions Endpoint ---
+  // 2. 聊天接口
   if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
     try {
       const body = await req.json();
-      const model = body.model || "tensor-max";
+      const model = body.model || "momentum-max";
       const fakeIp = getRandomIp();
       
       const headers = new Headers(FAKE_HEADERS_BASE);
       headers.set("cookie", Deno.env.get("MOVEMENT_COOKIE") || DEFAULT_COOKIE);
       headers.set("X-Forwarded-For", fakeIp);
-      headers.set("X-Real-IP", fakeIp);
 
-      // Prepare payload with Tool Calling support
       const payload: any = {
         messages: body.messages.map((m: any) => ({
           role: m.role,
@@ -80,13 +72,11 @@ serve(async (req) => {
           ...(m.tool_call_id && { tool_call_id: m.tool_call_id }),
         })),
         model: model,
-        stream: true, // Force stream for parsing tool/text parts
+        stream: true,
       };
 
       if (body.tools) payload.tools = body.tools;
       if (body.tool_choice) payload.tool_choice = body.tool_choice;
-
-      console.log(`[Proxy] Requesting ${model} | IP: ${fakeIp}`);
 
       const response = await fetch(TARGET_URL, {
         method: "POST",
@@ -94,19 +84,10 @@ serve(async (req) => {
         body: JSON.stringify(payload)
       });
 
-      // Handle WAF or Auth failures
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`[Error] Upstream returned ${response.status}:`, errorText.slice(0, 300));
-        return new Response(JSON.stringify({ 
-          error: { message: "Upstream Error or Cloudflare Block", code: response.status, details: errorText.slice(0, 100) } 
-        }), { 
-          status: response.status, 
-          headers: { ...corsHeaders, "Content-Type": "application/json" } 
-        });
+        return new Response(await response.text(), { status: response.status, headers: corsHeaders });
       }
 
-      // --- Stream Transformer ---
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body?.getReader();
@@ -128,70 +109,73 @@ serve(async (req) => {
                 if (!line.trim()) continue;
 
                 const timestamp = Math.floor(Date.now() / 1000);
-                let openaiChunk: any = null;
+                const chunkId = `chatcmpl-${timestamp}`;
+                let delta: any = null;
 
-                // Case A: Text Content (Protocol 0:)
-                if (line.startsWith('0:')) {
+                // --- 解析逻辑 ---
+                
+                // 1. 思考过程 (g: 标签)
+                if (line.startsWith('g:')) {
                   try {
-                    const content = JSON.parse(line.substring(2));
-                    openaiChunk = {
-                      id: `chatcmpl-${timestamp}`,
-                      choices: [{ index: 0, delta: { content }, finish_reason: null }]
-                    };
-                  } catch { /* ignore parse error */ }
+                    const reasoning = JSON.parse(line.substring(2));
+                    delta = { reasoning_content: reasoning };
+                  } catch {
+                    // 如果不是 JSON 格式，按原样处理字符串
+                    delta = { reasoning_content: line.substring(2).replace(/^"(.*)"$/, '$1') };
+                  }
                 } 
                 
-                // Case B: Tool Calling (Protocol 9:)
+                // 2. 正文内容 (0: 标签)
+                else if (line.startsWith('0:')) {
+                  try {
+                    delta = { content: JSON.parse(line.substring(2)) };
+                  } catch {
+                    delta = { content: line.substring(2).replace(/^"(.*)"$/, '$1') };
+                  }
+                }
+
+                // 3. 工具调用 (9: 标签)
                 else if (line.startsWith('9:')) {
                   try {
                     const toolData = JSON.parse(line.substring(2));
-                    openaiChunk = {
-                      id: `chatcmpl-${timestamp}`,
-                      choices: [{
+                    delta = {
+                      tool_calls: [{
                         index: 0,
-                        delta: {
-                          tool_calls: [{
-                            index: 0,
-                            id: toolData.toolCallId,
-                            type: "function",
-                            function: {
-                              name: toolData.toolName,
-                              arguments: JSON.stringify(toolData.args)
-                            }
-                          }]
-                        },
-                        finish_reason: "tool_calls"
+                        id: toolData.toolCallId,
+                        type: "function",
+                        function: { name: toolData.toolName, arguments: JSON.stringify(toolData.args) }
                       }]
                     };
-                  } catch { /* ignore parse error */ }
+                  } catch {}
                 }
 
-                if (openaiChunk) {
-                  const data = {
+                if (delta) {
+                  const openaiData = {
+                    id: chunkId,
                     object: "chat.completion.chunk",
                     created: timestamp,
                     model: model,
-                    ...openaiChunk
+                    choices: [{ index: 0, delta: delta, finish_reason: null }]
                   };
-                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(openaiData)}\n\n`));
                 }
 
-                // Case C: Final Stop (Protocol d:)
+                // 4. 结束信号 (d: 标签)
                 if (line.startsWith('d:')) {
-                  const finalChunk = {
-                    id: `chatcmpl-${timestamp}`,
+                  const endData = {
+                    id: chunkId,
                     object: "chat.completion.chunk",
                     created: timestamp,
                     model: model,
                     choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
                   };
-                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(endData)}\n\n`));
                   controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
                 }
               }
             }
           } catch (e) {
-            console.error("Streaming error:", e);
+            console.error(e);
           } finally {
             controller.close();
           }
@@ -199,20 +183,13 @@ serve(async (req) => {
       });
 
       return new Response(stream, {
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-        }
+        headers: { ...corsHeaders, "Content-Type": "text/event-stream" }
       });
 
     } catch (e: any) {
-      return new Response(JSON.stringify({ error: e.message }), { 
-        status: 500, 
-        headers: { ...corsHeaders, "Content-Type": "application/json" } 
-      });
+      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
     }
   }
 
-  return new Response("Movement Proxy Active", { status: 200 });
+  return new Response("Movement Proxy reasoning-enabled", { status: 200 });
 });
