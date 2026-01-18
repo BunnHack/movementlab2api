@@ -1,24 +1,21 @@
 /**
- * Movement Labs Proxy - Bug Fixed Version
+ * Movement Labs to OpenAI Proxy (Stealth + Tool Calling)
+ * Target: Deno Deploy
  */
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 
 const TARGET_URL = "https://movementlabs.ai/api/chat";
 
-// 确保字符串是有效的 ByteString (仅包含 ASCII)
-function toByteString(str: string): string {
-  // 移除所有非 ASCII 字符，防止 Headers.set 崩溃
-  return str.replace(/[^\x00-\x7F]/g, "");
-}
-
-const FAKE_HEADERS_BASE: Record<string, string> = {
+// Stealth Configuration: Mimicking Chrome 140 on Linux
+const FAKE_HEADERS_BASE = {
   "accept": "*/*",
-  "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+  "accept-language": "zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
   "content-type": "application/json",
   "origin": "https://movementlabs.ai",
+  "priority": "u=1, i",
   "referer": "https://movementlabs.ai/",
-  "sec-ch-ua": '"Chromium";v="140", "Not?A_Brand";v="8"',
+  "sec-ch-ua": '"Mises";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
   "sec-ch-ua-mobile": "?0",
   "sec-ch-ua-platform": '"Linux"',
   "sec-fetch-dest": "empty",
@@ -27,10 +24,18 @@ const FAKE_HEADERS_BASE: Record<string, string> = {
   "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
 };
 
+// Random IP Generator for X-Forwarded-For to bypass simple rate limits
+function getRandomIp() {
+  return Array(4).fill(0).map(() => Math.floor(Math.random() * 255)).join('.');
+}
+
+// Fallback Cookie (Always set MOVEMENT_COOKIE in Deno Environment Variables for stability)
+const DEFAULT_COOKIE = `__client_uat=1768305449; __refresh_8YHPIyOx=s40qrTVvuyUfHobm6uhc; __client_uat_8YHPIyOx=1768305449; cf_clearance=o38m1S77g9O8JGQTxiRevC2Tbhtcs5JKYayAbTKqnyA-1768536929-1.2.1.1-OYB136VjKrCkdfTRynI8SBUnbSigPj_dkMUsJFBn0dykx_3pG.8v6EOsG_kHjgOYGUPwTPm6jga4YDZifpSGDcEc_GLK77kNnxnzGTACJHKucADGPvr541eR1D_VefSDd2.E2r_xebEvOvqBHXfTFhufy1XtpzaE0wik0wEyw0SeBfPZ70eFjb24tVaOnNFLhz5jv9ySDJyIhRneFQ0ocYOGPZdp.7iyhXHiKsKrXJo; clerk_active_context=sess_38CZKUBoHnuu2A335FdHjqZM4xE:; __session=...;`;
+
 serve(async (req) => {
   const url = new URL(req.url);
-  const path = url.pathname.replace(/\/+$/, ""); // 去除末尾斜杠
 
+  // --- CORS Handling ---
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -41,12 +46,12 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 路由 1: GET /v1/models
-  if (path === "/v1/models") {
+  // --- 1. Model List Endpoint ---
+  if (url.pathname === "/v1/models") {
     const models = [
+      { id: "tensor-max", object: "model" },
       { id: "hawk-ultra", object: "model" },
       { id: "hawk-max", object: "model" },
-      { id: "tensor-max", object: "model" },
       { id: "momentum-max", object: "model" }
     ];
     return new Response(JSON.stringify({ object: "list", data: models }), {
@@ -54,72 +59,139 @@ serve(async (req) => {
     });
   }
 
-  // 路由 2: POST /v1/chat/completions
-  if (path === "/v1/chat/completions" && req.method === "POST") {
+  // --- 2. Chat Completions Endpoint ---
+  if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
     try {
       const body = await req.json();
       const model = body.model || "tensor-max";
+      const fakeIp = getRandomIp();
       
-      // 处理 Tool Calling 注入逻辑 (保持之前的逻辑)
-      let messages = body.messages || [];
-      if (body.tools && body.tools.length > 0) {
-        const toolPrompt = `\n\n[System: You have tools available. If needed, respond ONLY with JSON: {"tool": "name", "arguments": {...}}]`;
-        messages = [...messages, { role: "system", content: toolPrompt }];
-      }
-
-      // 构建 Headers，并进行 ByteString 校验
-      const headers = new Headers();
-      for (const [key, value] of Object.entries(FAKE_HEADERS_BASE)) {
-        headers.set(key, toByteString(value));
-      }
-      
-      // 从环境变量读取 Cookie，如果包含中文会被 toByteString 过滤掉
-      const rawCookie = Deno.env.get("MOVEMENT_COOKIE") || "";
-      headers.set("cookie", toByteString(rawCookie));
-      
-      // 随机 IP 伪装
-      const fakeIp = Array(4).fill(0).map(() => Math.floor(Math.random() * 255)).join('.');
+      const headers = new Headers(FAKE_HEADERS_BASE);
+      headers.set("cookie", Deno.env.get("MOVEMENT_COOKIE") || DEFAULT_COOKIE);
       headers.set("X-Forwarded-For", fakeIp);
+      headers.set("X-Real-IP", fakeIp);
+
+      // Prepare payload with Tool Calling support
+      const payload: any = {
+        messages: body.messages.map((m: any) => ({
+          role: m.role,
+          content: m.content || "",
+          ...(m.tool_calls && { tool_calls: m.tool_calls }),
+          ...(m.tool_call_id && { tool_call_id: m.tool_call_id }),
+        })),
+        model: model,
+        stream: true, // Force stream for parsing tool/text parts
+      };
+
+      if (body.tools) payload.tools = body.tools;
+      if (body.tool_choice) payload.tool_choice = body.tool_choice;
+
+      console.log(`[Proxy] Requesting ${model} | IP: ${fakeIp}`);
 
       const response = await fetch(TARGET_URL, {
         method: "POST",
         headers: headers,
-        body: JSON.stringify({ messages, model })
+        body: JSON.stringify(payload)
       });
 
+      // Handle WAF or Auth failures
       if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[Error] Upstream returned ${response.status}:`, errorText.slice(0, 300));
         return new Response(JSON.stringify({ 
-          error: "Upstream returned error", 
-          status: response.status 
-        }), { status: response.status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          error: { message: "Upstream Error or Cloudflare Block", code: response.status, details: errorText.slice(0, 100) } 
+        }), { 
+          status: response.status, 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
       }
 
-      // 流式转换
+      // --- Stream Transformer ---
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body?.getReader();
-          const decoder = new TextDecoder();
           if (!reader) return controller.close();
+
+          const decoder = new TextDecoder();
+          let buffer = "";
 
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              const lines = decoder.decode(value).split("\n");
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
               for (const line of lines) {
-                if (line.startsWith("0:")) {
-                  const content = JSON.parse(line.substring(2));
-                  const chunk = {
-                    id: `chatcmpl-${Date.now()}`,
-                    choices: [{ delta: { content }, index: 0, finish_reason: null }]
-                  };
-                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                if (!line.trim()) continue;
+
+                const timestamp = Math.floor(Date.now() / 1000);
+                let openaiChunk: any = null;
+
+                // Case A: Text Content (Protocol 0:)
+                if (line.startsWith('0:')) {
+                  try {
+                    const content = JSON.parse(line.substring(2));
+                    openaiChunk = {
+                      id: `chatcmpl-${timestamp}`,
+                      choices: [{ index: 0, delta: { content }, finish_reason: null }]
+                    };
+                  } catch { /* ignore parse error */ }
+                } 
+                
+                // Case B: Tool Calling (Protocol 9:)
+                else if (line.startsWith('9:')) {
+                  try {
+                    const toolData = JSON.parse(line.substring(2));
+                    openaiChunk = {
+                      id: `chatcmpl-${timestamp}`,
+                      choices: [{
+                        index: 0,
+                        delta: {
+                          tool_calls: [{
+                            index: 0,
+                            id: toolData.toolCallId,
+                            type: "function",
+                            function: {
+                              name: toolData.toolName,
+                              arguments: JSON.stringify(toolData.args)
+                            }
+                          }]
+                        },
+                        finish_reason: "tool_calls"
+                      }]
+                    };
+                  } catch { /* ignore parse error */ }
                 }
-                if (line.startsWith("d:")) {
+
+                if (openaiChunk) {
+                  const data = {
+                    object: "chat.completion.chunk",
+                    created: timestamp,
+                    model: model,
+                    ...openaiChunk
+                  };
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+                }
+
+                // Case C: Final Stop (Protocol d:)
+                if (line.startsWith('d:')) {
+                  const finalChunk = {
+                    id: `chatcmpl-${timestamp}`,
+                    object: "chat.completion.chunk",
+                    created: timestamp,
+                    model: model,
+                    choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                  };
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
                   controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
                 }
               }
             }
+          } catch (e) {
+            console.error("Streaming error:", e);
           } finally {
             controller.close();
           }
@@ -127,10 +199,14 @@ serve(async (req) => {
       });
 
       return new Response(stream, {
-        headers: { ...corsHeaders, "Content-Type": "text/event-stream" }
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        }
       });
 
-    } catch (e) {
+    } catch (e: any) {
       return new Response(JSON.stringify({ error: e.message }), { 
         status: 500, 
         headers: { ...corsHeaders, "Content-Type": "application/json" } 
@@ -138,10 +214,5 @@ serve(async (req) => {
     }
   }
 
-  // 兜底错误响应：返回 JSON 格式，防止客户端解析 "Not Found" 字符串失败
-  return new Response(JSON.stringify({ error: "Route not found", path: url.pathname }), { 
-    status: 404, 
-    headers: { ...corsHeaders, "Content-Type": "application/json" } 
-  });
+  return new Response("Movement Proxy Active", { status: 200 });
 });
-                                          
