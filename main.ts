@@ -1,6 +1,6 @@
 /**
- * Movement Labs to OpenAI Proxy (V3 - MCP Optimizer)
- * 解決模型「裝傻」不認工具的問題
+ * Movement Labs to OpenAI Proxy (V4 - Bug Fix & Stability)
+ * 修復了 url undefined 錯誤與 JSON 解析崩潰問題
  */
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
@@ -23,41 +23,51 @@ function getRandomIp() {
 }
 
 serve(async (req) => {
+  const url = new URL(req.url); // 確保 url 在作用域內
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
     "Access-Control-Allow-Headers": "*",
   };
 
+  // 處理 CORS 預檢
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
+  // 1. 模型列表接口
   if (url.pathname === "/v1/models") {
     return new Response(JSON.stringify({
       object: "list",
-      data: [{ id: "momentum-max", object: "model" }, { id: "tensor-max", object: "model" }]
+      data: [
+        { id: "momentum-max", object: "model" },
+        { id: "tensor-max", object: "model" },
+        { id: "hawk-ultra", object: "model" }
+      ]
     }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
   }
 
+  // 2. 聊天接口
   if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
     try {
-      const body = await req.json();
+      // 安全解析 JSON，防止 client 傳錯導致 Crash
+      let body;
+      try {
+        body = await req.json();
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON request body" }), { status: 400, headers: corsHeaders });
+      }
+
       const model = body.model || "momentum-max";
+      let messages = [...(body.messages || [])];
       
-      // --- 工具檢查與系統提示詞注入 ---
-      let messages = [...body.messages];
+      // --- MCP 工具注入與日誌 ---
       if (body.tools && body.tools.length > 0) {
-        console.log(`[MCP] 檢測到工具: ${body.tools.map(t => t.function.name).join(', ')}`);
-        
-        // 注入一段話，強迫模型認帳 (Reasoning 模型有時需要這點推力)
-        const toolHint = `[System Notice: You have access to ${body.tools.length} MCP tools. If the user asks for info you don't have, you MUST use tool_calls. Do NOT say you don't have access.]`;
-        
-        if (messages[0].role === 'system') {
+        console.log(`[MCP] 收到工具定義: ${body.tools.map((t: any) => t.function.name).join(', ')}`);
+        const toolHint = `[System: You have access to MCP tools. If needed, use them via tool_calls. Do not deny your capability.]`;
+        if (messages.length > 0 && messages[0].role === 'system') {
           messages[0].content += "\n" + toolHint;
         } else {
           messages.unshift({ role: 'system', content: toolHint });
         }
-      } else {
-        console.log("[MCP] 警告: 此請求未攜帶 tools");
       }
 
       const payload = {
@@ -73,16 +83,29 @@ serve(async (req) => {
         ...(body.tool_choice && { tool_choice: body.tool_choice }),
       };
 
+      console.log(`[Request] 向 Movement Labs 發送請求...`);
+
       const response = await fetch(TARGET_URL, {
         method: "POST",
         headers: {
           ...FAKE_HEADERS_BASE,
-          "cookie": Deno.env.get("MOVEMENT_COOKIE") || "",
+          "cookie": Deno.env.get("MOVEMENT_COOKIE") || "", // 確保環境變量已設置
           "X-Forwarded-For": getRandomIp(),
         },
         body: JSON.stringify(payload)
       });
 
+      // 如果上游報錯（例如 403, 500），不要嘗試 parse JSON
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[Upstream Error] ${response.status}: ${errorText.slice(0, 100)}`);
+        return new Response(JSON.stringify({ error: "Upstream returned error", status: response.status, detail: errorText.slice(0, 50) }), { 
+          status: response.status, 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
+      }
+
+      // --- 流式處理 ---
       return new Response(new ReadableStream({
         async start(controller) {
           const reader = response.body?.getReader();
@@ -103,54 +126,65 @@ serve(async (req) => {
                 const timestamp = Math.floor(Date.now() / 1000);
                 let delta: any = null;
 
-                if (line.startsWith('g:')) { // 思考過程
-                  delta = { reasoning_content: JSON.parse(line.substring(2)) };
-                } else if (line.startsWith('0:')) { // 正文
-                  delta = { content: JSON.parse(line.substring(2)) };
-                } else if (line.startsWith('9:')) { // 工具調用
-                  const toolData = JSON.parse(line.substring(2));
-                  console.log(`[MCP] 模型決定調用工具: ${toolData.toolName}`);
-                  delta = {
-                    tool_calls: [{
-                      index: 0,
-                      id: toolData.toolCallId,
-                      type: "function",
-                      function: { name: toolData.toolName, arguments: JSON.stringify(toolData.args) }
-                    }]
-                  };
+                try {
+                  if (line.startsWith('g:')) {
+                    delta = { reasoning_content: JSON.parse(line.substring(2)) };
+                  } else if (line.startsWith('0:')) {
+                    delta = { content: JSON.parse(line.substring(2)) };
+                  } else if (line.startsWith('9:')) {
+                    const toolData = JSON.parse(line.substring(2));
+                    console.log(`[MCP] 觸發工具調用: ${toolData.toolName}`);
+                    delta = {
+                      tool_calls: [{
+                        index: 0,
+                        id: toolData.toolCallId,
+                        type: "function",
+                        function: { name: toolData.toolName, arguments: JSON.stringify(toolData.args) }
+                      }]
+                    };
+                  }
+                } catch (e) {
+                  // 忽略單行解析失敗，繼續處理
+                  continue;
                 }
 
                 if (delta) {
-                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+                  const chunk = {
                     id: `chatcmpl-${timestamp}`,
                     object: "chat.completion.chunk",
                     created: timestamp,
                     model: model,
                     choices: [{ index: 0, delta: delta, finish_reason: line.startsWith('9:') ? "tool_calls" : null }]
-                  })}\n\n`));
+                  };
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 }
 
                 if (line.startsWith('d:')) {
-                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+                  const endChunk = {
                     id: `chatcmpl-${timestamp}`,
                     object: "chat.completion.chunk",
                     created: timestamp,
                     model: model,
                     choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-                  })}\n\n`));
+                  };
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(endChunk)}\n\n`));
                   controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
                 }
               }
             }
+          } catch (err) {
+            console.error("[Stream Error]", err);
           } finally {
             controller.close();
           }
         }
       }), { headers: { ...corsHeaders, "Content-Type": "text/event-stream" } });
 
-    } catch (e) {
+    } catch (e: any) {
+      console.error("[Fatal Error]", e);
       return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
     }
   }
-  return new Response("OK", { status: 200 });
+
+  return new Response("Movement Proxy Stable Version", { status: 200 });
 });
