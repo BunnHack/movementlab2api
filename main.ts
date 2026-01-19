@@ -1,13 +1,13 @@
 /**
- * Movement Labs to OpenAI Proxy (Stealth + Tool Calling + Reasoning)
- * Deployed on Deno Deploy
+ * Movement Labs to OpenAI Proxy (Ultimate Version)
+ * 支援功能：思考過程 (Reasoning) + 工具調用 (MCP/Tool Calling) + 詳細日誌 (Debug)
  */
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 
 const TARGET_URL = "https://movementlabs.ai/api/chat";
 
-// 伪装配置
+// 偽裝瀏覽器 Header
 const FAKE_HEADERS_BASE = {
   "accept": "*/*",
   "accept-language": "zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
@@ -28,11 +28,11 @@ function getRandomIp() {
   return Array(4).fill(0).map(() => Math.floor(Math.random() * 255)).join('.');
 }
 
+// 預設 Cookie (建議在 Deno Deploy 環境變量設置 MOVEMENT_COOKIE)
 const DEFAULT_COOKIE = `__client_uat=1768305449; __refresh_8YHPIyOx=s40qrTVvuyUfHobm6uhc; __client_uat_8YHPIyOx=1768305449; cf_clearance=...;`;
 
 serve(async (req) => {
   const url = new URL(req.url);
-
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -41,7 +41,7 @@ serve(async (req) => {
 
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-  // 1. 模型列表
+  // 1. 模型清單
   if (url.pathname === "/v1/models") {
     const models = [
       { id: "momentum-max", object: "model" },
@@ -60,10 +60,19 @@ serve(async (req) => {
       const model = body.model || "momentum-max";
       const fakeIp = getRandomIp();
       
+      // --- DEBUG: 檢查 MCP 工具是否有傳入 ---
+      if (body.tools) {
+        console.log(`[MCP] 接收到來自 UI 的工具定義: ${body.tools.length} 個`);
+        body.tools.forEach((t: any) => console.log(` - 工具名稱: ${t.function.name}`));
+      } else {
+        console.log(`[MCP] 警告: 請求中未發現 tools 欄位 (MCP 可能未激活)`);
+      }
+
       const headers = new Headers(FAKE_HEADERS_BASE);
       headers.set("cookie", Deno.env.get("MOVEMENT_COOKIE") || DEFAULT_COOKIE);
       headers.set("X-Forwarded-For", fakeIp);
 
+      // 構造發往 Movement Labs 的 Payload
       const payload: any = {
         messages: body.messages.map((m: any) => ({
           role: m.role,
@@ -75,8 +84,11 @@ serve(async (req) => {
         stream: true,
       };
 
+      // 透傳工具參數
       if (body.tools) payload.tools = body.tools;
       if (body.tool_choice) payload.tool_choice = body.tool_choice;
+
+      console.log(`[Request] 發送請求至 Movement Labs (${model})`);
 
       const response = await fetch(TARGET_URL, {
         method: "POST",
@@ -85,7 +97,9 @@ serve(async (req) => {
       });
 
       if (!response.ok) {
-        return new Response(await response.text(), { status: response.status, headers: corsHeaders });
+        const err = await response.text();
+        console.error(`[Upstream Error] ${response.status}: ${err}`);
+        return new Response(err, { status: response.status, headers: corsHeaders });
       }
 
       const stream = new ReadableStream({
@@ -108,24 +122,23 @@ serve(async (req) => {
               for (const line of lines) {
                 if (!line.trim()) continue;
 
+                // 這裡可以打印原始行來調試： console.log("Raw:", line);
+                
                 const timestamp = Math.floor(Date.now() / 1000);
                 const chunkId = `chatcmpl-${timestamp}`;
                 let delta: any = null;
 
-                // --- 解析逻辑 ---
-                
-                // 1. 思考过程 (g: 标签)
+                // --- 1. 思考過程處理 (momentum-max 專屬) ---
                 if (line.startsWith('g:')) {
                   try {
                     const reasoning = JSON.parse(line.substring(2));
                     delta = { reasoning_content: reasoning };
                   } catch {
-                    // 如果不是 JSON 格式，按原样处理字符串
                     delta = { reasoning_content: line.substring(2).replace(/^"(.*)"$/, '$1') };
                   }
                 } 
                 
-                // 2. 正文内容 (0: 标签)
+                // --- 2. 正文內容處理 ---
                 else if (line.startsWith('0:')) {
                   try {
                     delta = { content: JSON.parse(line.substring(2)) };
@@ -134,19 +147,25 @@ serve(async (req) => {
                   }
                 }
 
-                // 3. 工具调用 (9: 标签)
+                // --- 3. 工具調用處理 (MCP 核心) ---
                 else if (line.startsWith('9:')) {
+                  console.log(`[MCP] 偵測到模型正在發起工具調用: ${line}`);
                   try {
                     const toolData = JSON.parse(line.substring(2));
                     delta = {
                       tool_calls: [{
                         index: 0,
-                        id: toolData.toolCallId,
+                        id: toolData.toolCallId || `call_${Date.now()}`,
                         type: "function",
-                        function: { name: toolData.toolName, arguments: JSON.stringify(toolData.args) }
+                        function: { 
+                          name: toolData.toolName, 
+                          arguments: JSON.stringify(toolData.args) 
+                        }
                       }]
                     };
-                  } catch {}
+                  } catch (e) {
+                    console.error("[MCP Parse Error]", e);
+                  }
                 }
 
                 if (delta) {
@@ -155,12 +174,16 @@ serve(async (req) => {
                     object: "chat.completion.chunk",
                     created: timestamp,
                     model: model,
-                    choices: [{ index: 0, delta: delta, finish_reason: null }]
+                    choices: [{ 
+                      index: 0, 
+                      delta: delta, 
+                      finish_reason: line.startsWith('9:') ? "tool_calls" : null 
+                    }]
                   };
                   controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(openaiData)}\n\n`));
                 }
 
-                // 4. 结束信号 (d: 标签)
+                // --- 4. 結束處理 ---
                 if (line.startsWith('d:')) {
                   const endData = {
                     id: chunkId,
@@ -175,7 +198,7 @@ serve(async (req) => {
               }
             }
           } catch (e) {
-            console.error(e);
+            console.error("Stream Loop Error:", e);
           } finally {
             controller.close();
           }
@@ -183,7 +206,12 @@ serve(async (req) => {
       });
 
       return new Response(stream, {
-        headers: { ...corsHeaders, "Content-Type": "text/event-stream" }
+        headers: { 
+          ...corsHeaders, 
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        }
       });
 
     } catch (e: any) {
@@ -191,5 +219,5 @@ serve(async (req) => {
     }
   }
 
-  return new Response("Movement Proxy reasoning-enabled", { status: 200 });
+  return new Response("Movement Proxy Reasoning & MCP Ready", { status: 200 });
 });
